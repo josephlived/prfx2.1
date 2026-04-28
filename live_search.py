@@ -47,6 +47,7 @@ STREET_TYPE_TOKENS = {
     "terrace",
     "trail",
     "plaza",
+    "plz",
     "square",
     "route",
     "pike",
@@ -217,21 +218,18 @@ class BraveSearchClient:
                 break
         if state_index <= 0:
             return ""
-        city_tokens: List[str] = []
-        for index in range(state_index - 1, -1, -1):
-            token = search_tokens[index]
-            if token.isdigit():
-                break
-            if token in DIRECTION_TOKENS:
-                break
-            if token in LOCATION_NOISE_TOKENS:
-                break
-            city_tokens.append(token)
+        before_state = search_tokens[:state_index]
+        last_street_index = -1
+        for index, token in enumerate(before_state):
             if token in STREET_TYPE_TOKENS:
-                city_tokens = []
-            if len(city_tokens) == 2:
-                break
-        return " ".join(reversed(city_tokens)).strip()
+                last_street_index = index
+        city_source = before_state[last_street_index + 1 :]
+        city_tokens = [
+            token
+            for token in city_source
+            if not token.isdigit() and token not in DIRECTION_TOKENS and token not in LOCATION_NOISE_TOKENS
+        ]
+        return " ".join(city_tokens[-2:]).strip()
 
     def _postal_token(self, address: str) -> str:
         normalized = normalize_address(address)
@@ -240,7 +238,7 @@ class BraveSearchClient:
             return ""
         search_tokens = tokens[:-1] if tokens[-1] == "us" else tokens
         for token in reversed(search_tokens):
-            if token.isdigit() and len(token) >= 4:
+            if token.isdigit() and len(token) >= 5:
                 return token
         return ""
 
