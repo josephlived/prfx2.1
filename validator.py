@@ -402,6 +402,17 @@ def _looks_like_specific_address(address: str) -> bool:
     return bool(re.search(r"\d", normalized) and STREET_HINT_RE.search(normalized))
 
 
+def _related_search_names(row_fragment: str, matched_name: str, catalog: CompanyCatalog) -> List[str]:
+    names: List[str] = []
+    seen: set[str] = set()
+    for candidate in [row_fragment, matched_name, catalog.parent_company]:
+        key = normalize_company_name(candidate)
+        if key and key not in seen:
+            seen.add(key)
+            names.append(candidate)
+    return names
+
+
 def validate_standard_rows(
     rows: List[InputRow],
     catalog: CompanyCatalog,
@@ -580,11 +591,12 @@ def validate_standard_rows(
                 if search_client is not None and search_client.is_configured() and is_usable_address(candidate_address):
                     if progress_callback is not None:
                         progress_callback(index - 1, total_rows, f"Row {row.row_number}: live searching {matched_name} + {candidate_address}")
+                    search_names = _related_search_names(matched_fragment, matched_name, catalog)
                     live_search_url, live_search_mode, live_search_error, live_search_debug = search_client.find_address_evidence(
-                        matched_name,
+                        search_names[0],
                         candidate_address,
                         catalog.accepted_domains,
-                        related_company_names=[catalog.parent_company],
+                        related_company_names=search_names[1:],
                     )
                     if live_search_url:
                         evidence_label = "exact address" if live_search_mode == "exact_address" else "location"
@@ -605,7 +617,7 @@ def validate_standard_rows(
                     if live_search_error:
                         search_returned = f"Live search could not confirm {candidate_address}. Diagnostic: {live_search_error}"
 
-                    if False:
+                    if False and _looks_like_specific_address(candidate_address):
                         for accepted_entity in catalog.accepted_entities:
                             if accepted_entity == matched_name:
                                 continue
