@@ -338,9 +338,12 @@ class BraveSearchClient:
                 queries.append(query)
 
         for candidate_name in company_names:
-            _add_query(f"\"{candidate_name}\" \"{address}\"")
-            if address_variant:
+            if country == "us" and address_variant:
                 _add_query(f"\"{candidate_name}\" \"{address_variant}\"")
+            else:
+                _add_query(f"\"{candidate_name}\" \"{address}\"")
+                if address_variant:
+                    _add_query(f"\"{candidate_name}\" \"{address_variant}\"")
             if city and state and postal:
                 _add_query(f"\"{candidate_name}\" \"{city}\" \"{state}\" \"{postal}\"")
             elif city and state:
