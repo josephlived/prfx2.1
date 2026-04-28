@@ -1,0 +1,6 @@
+streamlit>=1.43
+pandas>=2.2
+openpyxl>=3.1
+ipwhois>=1.2
+rapidfuzz>=3.9
+playwright>=1.54
