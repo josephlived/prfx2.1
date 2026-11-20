@@ -15,7 +15,8 @@ import pytest
 
 from address_evidence_cache import AddressEvidenceCache
 from models import InputRow, WhoisRecord
-from regression_fixture import ACCEPTED_SUBSIDIARIES, ROWS, NoWhoisClient, ReplaySearchClient
+from live_search import SEARCH_NOT_FOUND
+from regression_fixture import ACCEPTED_SUBSIDIARIES, DBA_ALIASES, PARENT, ROWS, NoWhoisClient, ReplaySearchClient
 from validator import build_catalog, dataframe_to_rows, validate_standard_rows
 
 ADDRESS = "909 LOCUST ST DES MOINES IA 50309-2801 US"
@@ -33,7 +34,7 @@ class FakeSearch:
         self.calls.append((company_name, address))
         if self.url:
             return self.url, self.mode, "", f"fake {self.mode}"
-        return None, "", "Live search did not find address or location evidence on the searched pages.", "fake miss"
+        return None, "", SEARCH_NOT_FOUND, "fake miss"
 
 
 class FakeWhois:
@@ -56,7 +57,7 @@ def cache(tmp_path):
 
 @pytest.fixture
 def accenture():
-    return build_catalog("Accenture", ACCEPTED_SUBSIDIARIES, "", "", "")
+    return build_catalog(PARENT, ACCEPTED_SUBSIDIARIES, DBA_ALIASES, "", "")
 
 
 def run(rows, catalog, cache, search=None, whois=None):
@@ -192,5 +193,5 @@ def test_regression_expected_verdicts(accenture, cache):
     # The five rows the old engine wrongly marked FALSE are now To Review (Steps 3-4 aim to make them TRUE).
     for prefix in ("12.188.169.208/28", "152.193.173.184/30", "173.252.132.152/30", "206.136.82.208/29", "208.244.7.8/29"):
         assert results[prefix].column_h == "To Review", prefix
-    # "Accenture US" is not an accepted name yet (Step 2 adds alias handling).
-    assert (results["208.185.177.200/29"].column_e, results["208.185.177.200/29"].column_h) == ("FALSE", "Medium")
+    # "Accenture US" is exact via the DBA list; its address was not found, so it is To Review (analyst said FALSE).
+    assert results["208.185.177.200/29"].column_h == "To Review"
