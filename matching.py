@@ -204,12 +204,26 @@ def clean_company_name(raw_value: str) -> str:
     return ""
 
 
+# Different spellings of the same legal ending count as the same ending.
+SUFFIX_CANONICAL = {
+    "incorporated": "inc",
+    "corporation": "corp",
+    "company": "co",
+    "limited": "ltd",
+}
+
+DOTTED_ABBREVIATION_RE = re.compile(r"\b(?:[a-z]\.){2,}")
+
+
 def normalize_company_name(value: str, remove_suffixes: bool = False, remove_articles: bool = False) -> str:
     lowered = value.lower().replace("&", " and ")
     lowered = re.sub(r"\bint['\u2019`]?l\b", "intl", lowered)
+    # Collapse dotted abbreviations so "L.L.P." == "LLP" and "N.A." == "NA".
+    lowered = DOTTED_ABBREVIATION_RE.sub(lambda match: match.group(0).replace(".", ""), lowered)
     lowered = re.sub(r"[^a-z0-9\s]", " ", lowered)
     lowered = re.sub(r"\s+", " ", lowered).strip()
     tokens = [COMPANY_ABBREVIATIONS.get(token, token) for token in lowered.split()]
+    tokens = [SUFFIX_CANONICAL.get(token, token) for token in tokens]
     if remove_articles:
         tokens = [token for token in tokens if token not in ARTICLES]
     if remove_suffixes:
@@ -253,7 +267,20 @@ def _strip_trailing_digits(value: str) -> str:
     return re.sub(r"\d+$", "", value).strip()
 
 
+# Scores for names that are close to an accepted name but not exact.
+SAME_NAME_DIFFERENT_ENDING_SCORE = 99
+ACRONYM_SCORE = 98
+FUZZY_THRESHOLD = 97
+
+
 def classify_company_match(candidate: str, catalog: CompanyCatalog) -> Tuple[str, str, int]:
+    """Return (accepted_name, kind, score); kind is "exact", "inexact" or "none".
+
+    exact   = listed in the Alias / DBA box, or the same name with the same legal ending
+              (ignoring capitals, punctuation, spacing, "the", and spellings like L.L.P. / LLP).
+    inexact = same name with a missing or different legal ending ("Accenture" vs "Accenture Plc",
+              "Accenture LLP" vs "Accenture Plc"), an acronym, or a very close spelling.
+    """
     cleaned = clean_company_name(candidate)
     normalized = normalize_company_name(cleaned)
     if not normalized:
@@ -263,34 +290,31 @@ def classify_company_match(candidate: str, catalog: CompanyCatalog) -> Tuple[str
     if alias_hit:
         return alias_hit, "exact", 100
 
-    best_name = ""
-    best_kind = "none"
-    best_score = 0
-    norm_no_suffix = normalize_company_name(cleaned, remove_suffixes=True, remove_articles=False)
-    norm_no_suffix_article = normalize_company_name(cleaned, remove_suffixes=True, remove_articles=True)
+    no_article = normalize_company_name(cleaned, remove_articles=True)
+    base = normalize_company_name(cleaned, remove_suffixes=True, remove_articles=True)
+    digits_stripped = _strip_trailing_digits(normalized)
 
+    best_name = ""
+    best_score = 0
     for entity in catalog.accepted_entities:
         entity_norm = normalize_company_name(entity)
-        if normalized == entity_norm:
+        entity_no_article = normalize_company_name(entity, remove_articles=True)
+        if normalized == entity_norm or no_article == entity_no_article:
             return entity, "exact", 100
-        if _strip_trailing_digits(normalized) == entity_norm:
+        if digits_stripped and digits_stripped == entity_norm:
             return entity, "exact", 100
-        if normalized == company_acronym(entity):
-            return entity, "exact", 100
-        entity_no_suffix = normalize_company_name(entity, remove_suffixes=True, remove_articles=False)
-        entity_no_suffix_article = normalize_company_name(entity, remove_suffixes=True, remove_articles=True)
-        if norm_no_suffix and norm_no_suffix == entity_no_suffix:
-            score = 99
-            if score > best_score:
-                best_name, best_kind, best_score = entity, "inexact", score
-        if norm_no_suffix_article and norm_no_suffix_article == entity_no_suffix_article:
-            return entity, "exact", 100
-        score = fuzzy_score(normalized, entity_norm)
+        entity_base = normalize_company_name(entity, remove_suffixes=True, remove_articles=True)
+        if base and base == entity_base:
+            score = SAME_NAME_DIFFERENT_ENDING_SCORE
+        elif normalized == company_acronym(entity):
+            score = ACRONYM_SCORE
+        else:
+            score = fuzzy_score(normalized, entity_norm)
         if score > best_score:
-            best_name, best_kind, best_score = entity, "inexact", score
+            best_name, best_score = entity, score
 
-    if best_score >= 97:
-        return best_name, best_kind, best_score
+    if best_score >= FUZZY_THRESHOLD:
+        return best_name, "inexact", best_score
     return "", "none", best_score
 
 

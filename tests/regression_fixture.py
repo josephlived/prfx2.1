@@ -13,9 +13,14 @@ from __future__ import annotations
 
 from typing import Iterable, Optional, Tuple
 
+from live_search import SEARCH_NOT_FOUND
 from matching import normalize_address
 
-ACCEPTED_SUBSIDIARIES = "Accenture Plc\nAccenture LLP\nAccenture"
+# Sidebar inputs for these runs.
+PARENT = "Accenture Plc"
+ACCEPTED_SUBSIDIARIES = "Accenture LLP"
+# Registry rows often say just "ACCENTURE" or "Accenture US". Those are only exact names when listed here.
+DBA_ALIASES = "Accenture => Accenture Plc\nAccenture US => Accenture Plc"
 
 ROWS = [
     # File 1 (validation-results_3.xlsx)
@@ -88,7 +93,7 @@ class ReplaySearchClient:
         if hit:
             url, mode = hit
             return url, mode, "", f"replayed {mode} {url}"
-        return None, "", "Live search did not find address or location evidence on the searched pages.", "replayed miss"
+        return None, "", SEARCH_NOT_FOUND, "replayed miss"
 
 
 class NoWhoisClient:

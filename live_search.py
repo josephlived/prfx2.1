@@ -15,6 +15,9 @@ USER_AGENT = "PrefixWorkbench/1.0 (+https://local.app)"
 SEARCH_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
 MAX_SEARCH_QUERIES = 3
 MAX_PAGE_FETCHES = 3
+# Returned as the error when searches ran fine but found no evidence. Any other error text means the
+# search itself could not run (bad key, rate limit, network), which is not evidence of anything.
+SEARCH_NOT_FOUND = "Live search did not find address or location evidence on the searched pages."
 
 DIRECTION_TOKENS = {
     "north",
@@ -354,12 +357,14 @@ class BraveSearchClient:
         debug_lines: List[str] = []
         fallback_state_country: Optional[Tuple[str, str]] = None
         page_fetches = 0
+        any_query_ok = False
         for query in queries:
             results, error = self._search(query)
             if error:
                 last_error = error
                 debug_lines.append(f"query={query} error={error}")
                 continue
+            any_query_ok = True
             debug_lines.append(f"query={query} results={len(results)}")
             for item in results:
                 url = str(item.get("url", "")).strip()
@@ -497,4 +502,6 @@ class BraveSearchClient:
             url, mode = fallback_state_country
             debug_lines.append(f"location_only_fallback={url}")
             return url, mode, "", "\n".join(debug_lines)
-        return None, "", last_error or "Live search did not find address or location evidence on the searched pages.", "\n".join(debug_lines)
+        if any_query_ok:
+            return None, "", SEARCH_NOT_FOUND, "\n".join(debug_lines)
+        return None, "", last_error or "No live search query could be run for this address.", "\n".join(debug_lines)

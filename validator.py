@@ -23,7 +23,7 @@ from matching import (
 )
 from models import CompanyCatalog, InputRow, ValidationResult, WhoisOnlyResult
 from domain_crawler import DomainEvidenceClient
-from live_search import BraveSearchClient
+from live_search import SEARCH_NOT_FOUND, BraveSearchClient
 from whois_lookup import WhoisLookupClient
 
 
@@ -445,6 +445,10 @@ class AddressCheck:
     location_only_url: str = ""
     search_error: str = ""
     saw_private: bool = False
+    # searched_ok: at least one live search ran and returned results to check.
+    # search_failed: a live search could not run (bad key, rate limit, network error).
+    searched_ok: bool = False
+    search_failed: bool = False
     debug: str = ""
 
 
@@ -517,6 +521,10 @@ def _confirm_address(
                 return found
             if url and not check.location_only_url:
                 check.location_only_url = url
+            if url or error == SEARCH_NOT_FOUND:
+                check.searched_ok = True
+            elif error:
+                check.search_failed = True
             if error:
                 check.search_error = error
     if not search_ready and not check.search_error:
@@ -567,14 +575,37 @@ def _decide_from_address(matched_name: str, name_kind: str, name_score: int, che
         decision.search_returned = "Address was classified as Private Address."
         return decision
 
+    # Inexact name (missing/different legal ending, acronym, close spelling): the address decides.
+    # The search ran and found no exact address -> FALSE. If the search could not run -> To Review.
+    if name_kind != "exact" and check.searched_ok and not check.search_failed:
+        decision.verdict = "FALSE"
+        decision.confidence = "Medium"
+        decision.match_type = "inexact_name_address_not_found"
+        decision.reason = (
+            f"FALSE — Company name is close to {matched_name} but not an exact accepted name, "
+            "and live search did not find the exact address. Add the name to Accepted Subsidiaries "
+            "or Alias / DBA if it should count."
+        )
+        decision.search_returned = "Live search ran but found no exact-address evidence."
+        if check.location_only_url:
+            decision.reason += f" Location-only evidence (same city/state, not counted): {check.location_only_url}"
+        return decision
+
     decision.verdict = "FALSE"
     decision.confidence = TO_REVIEW
     decision.match_type = f"{name_kind}_name_address_unconfirmed"
-    decision.review_reason = "Company name matched, but the address could not be confirmed."
-    reason = (
-        f"To Review — {name_label} company name matched {matched_name}, "
-        "but the address could not be confirmed online. Verdict: FALSE."
-    )
+    if name_kind == "exact":
+        decision.review_reason = "Company name matched, but the address could not be confirmed."
+        reason = (
+            f"To Review — {name_label} company name matched {matched_name}, "
+            "but the address could not be confirmed online. Verdict: FALSE."
+        )
+    else:
+        decision.review_reason = "Company name is not exact and live search could not run to check the address."
+        reason = (
+            f"To Review — Company name is close to {matched_name} but not exact, and live search could not run "
+            f"to check the address ({check.search_error or 'no search'}). Verdict: FALSE."
+        )
     returned = "Address was not confirmed."
     if check.location_only_url:
         reason += f" Location-only evidence (same city/state, not counted): {check.location_only_url}"
@@ -599,9 +630,13 @@ def validate_standard_rows(
     """Validate rows with the name + address rule.
 
     1. Row has a company name and an address:
-         name not accepted              -> FALSE (no search is run)
-         name accepted, address found   -> TRUE (High for exact names, Medium for inexact)
-         name accepted, address unknown -> To Review (verdict FALSE)
+         name not accepted                     -> FALSE (no search is run)
+         exact name, address found             -> TRUE High
+         exact name, address not found         -> To Review (verdict FALSE)
+         inexact name, address found           -> TRUE Medium
+         inexact name, searched and not found  -> FALSE
+         inexact name, search could not run    -> To Review
+       "Inexact" = same name with a missing/different legal ending, an acronym, or a close spelling.
     2. Row is missing the name or the address: fill it in from RDAP, then apply the same rule.
     """
     results: List[ValidationResult] = []
