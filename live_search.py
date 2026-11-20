@@ -402,9 +402,14 @@ class BraveSearchClient:
                         if external_snippet_mode and self._company_in_snippet(snippet_text, candidate_name):
                             break
                         external_snippet_mode = ""
-                    if external_snippet_mode:
+                    if external_snippet_mode == "exact_address":
                         debug_lines.append(f"external_snippet_match={external_snippet_mode} url={url}")
                         return url, external_snippet_mode, "", "\n".join(debug_lines)
+                    if external_snippet_mode:
+                        # Location-only hit: remember it, but keep looking for exact-address evidence.
+                        debug_lines.append(f"external_snippet_location_only={external_snippet_mode} url={url}")
+                        if fallback_state_country is None:
+                            fallback_state_country = (url, external_snippet_mode)
                 if snippet_trust_enabled:
                     snippet_mode = ""
                     for candidate_name in company_names or [company_name]:
@@ -418,9 +423,13 @@ class BraveSearchClient:
                         )
                         if snippet_mode:
                             break
-                    if snippet_mode:
+                    if snippet_mode == "exact_address":
                         debug_lines.append(f"snippet_match={snippet_mode} url={url}")
                         return url, snippet_mode, "", "\n".join(debug_lines)
+                    if snippet_mode:
+                        debug_lines.append(f"snippet_location_only={snippet_mode} url={url}")
+                        if fallback_state_country is None:
+                            fallback_state_country = (url, snippet_mode)
                 if page_fetches >= MAX_PAGE_FETCHES:
                     debug_lines.append(f"skipped_page_fetch_limit={url}")
                     continue
@@ -439,9 +448,11 @@ class BraveSearchClient:
                         )
                         if snippet_mode:
                             break
-                    if snippet_mode:
+                    if snippet_mode == "exact_address":
                         debug_lines.append(f"snippet_match_after_fetch_error={snippet_mode} url={url}")
                         return url, snippet_mode, "", "\n".join(debug_lines)
+                    if snippet_mode and fallback_state_country is None:
+                        fallback_state_country = (url, snippet_mode)
                     last_error = fetch_error
                     debug_lines.append(f"fetch_error={url} error={fetch_error}")
                     continue
@@ -460,8 +471,9 @@ class BraveSearchClient:
                 if location_hit and city and f" {city} " not in f" {normalized_page} ":
                     location_hit = False
                 if location_hit and self._any_company_in_text(normalized_page, company_names or [company_name]):
-                    debug_lines.append(f"page_match=state_country url={url}")
-                    return url, "state_country", "", "\n".join(debug_lines)
+                    debug_lines.append(f"page_location_only=state_country url={url}")
+                    if fallback_state_country is None:
+                        fallback_state_country = (url, "state_country")
                 snippet_mode = ""
                 for candidate_name in company_names or [company_name]:
                     snippet_mode = self._snippet_match_mode(
@@ -474,11 +486,15 @@ class BraveSearchClient:
                     )
                     if snippet_mode:
                         break
-                if snippet_mode:
+                if snippet_mode == "exact_address":
                     debug_lines.append(f"snippet_match_post_page={snippet_mode} url={url}")
                     return url, snippet_mode, "", "\n".join(debug_lines)
+                if snippet_mode and fallback_state_country is None:
+                    fallback_state_country = (url, snippet_mode)
         if fallback_state_country:
+            # No exact-address evidence anywhere; report the location-only hit so the caller can show it.
+            # Callers must not treat "state_country" as a confirmed address.
             url, mode = fallback_state_country
-            debug_lines.append(f"external_state_country_accepted={url}")
+            debug_lines.append(f"location_only_fallback={url}")
             return url, mode, "", "\n".join(debug_lines)
         return None, "", last_error or "Live search did not find address or location evidence on the searched pages.", "\n".join(debug_lines)

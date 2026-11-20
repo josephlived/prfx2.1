@@ -10,7 +10,6 @@ from address_evidence_cache import AddressEvidenceCache
 from matching import (
     classify_company_match,
     clean_company_name,
-    coarse_location_match,
     find_address_match,
     is_private_address,
     is_usable_address,
@@ -413,6 +412,180 @@ def _related_search_names(row_fragment: str, matched_name: str, catalog: Company
     return names
 
 
+EXACT_WHOIS_TYPES = {
+    "whois_orgname_exact",
+    "whois_netname_exact",
+    "whois_orgname_exact_domain",
+    "whois_netname_exact_domain",
+}
+INEXACT_WHOIS_TYPES = {"whois_inexact_name_domain", "whois_close_not_exact"}
+TO_REVIEW = "To Review"
+# RDAP records can list several addresses (customer, provider, contacts). Cap how many we
+# try to confirm per row so one row cannot burn through live-search credit.
+MAX_ADDRESSES_PER_ROW = 3
+
+_METHOD_LABELS = {
+    "known_address": "known address list",
+    "datacenter": "known data-center list",
+    "cache": "previously verified address",
+    "domain_crawl": "accepted-domain page",
+    "live_search": "web page found by live search",
+}
+
+
+@dataclass
+class AddressCheck:
+    """Outcome of trying to confirm an address for a matched company."""
+
+    found: bool = False
+    method: str = ""
+    address: str = ""
+    source_url: str = ""
+    owner: str = ""
+    location_only_url: str = ""
+    search_error: str = ""
+    saw_private: bool = False
+    debug: str = ""
+
+
+@dataclass
+class RowDecision:
+    verdict: str = "FALSE"
+    reason: str = "FALSE — No connection found with the company or any of its subsidiaries."
+    matched_company: str = ""
+    confidence: str = "Medium"
+    match_type: str = "no_match"
+    match_score: int = 0
+    source_url: str = ""
+    review_reason: str = ""
+    search_returned: str = "No qualifying evidence found."
+
+
+def _confirm_address(
+    matched_name: str,
+    name_kind: str,
+    search_names: List[str],
+    addresses: List[str],
+    catalog: CompanyCatalog,
+    address_cache: Optional[AddressEvidenceCache],
+    domain_client: Optional[DomainEvidenceClient],
+    search_client: Optional[BraveSearchClient],
+    report: Callable[[str], None],
+) -> AddressCheck:
+    """Try to confirm the address, cheapest source first. Only exact-address evidence counts."""
+    check = AddressCheck()
+    debug_parts: List[str] = []
+    search_ready = search_client is not None and search_client.is_configured()
+    for candidate in addresses[:MAX_ADDRESSES_PER_ROW]:
+        if is_private_address(candidate):
+            check.saw_private = True
+            continue
+        if not is_usable_address(candidate):
+            continue
+        known = find_address_match(candidate, catalog.known_addresses)
+        if known:
+            return AddressCheck(True, "known_address", candidate, known.source_url, known.canonical_name)
+        if name_kind == "exact" and normalize_address(candidate) in KNOWN_DATA_CENTER_ADDRESSES:
+            return AddressCheck(True, "datacenter", candidate, "", matched_name)
+        cached = address_cache.get(candidate, catalog) if address_cache is not None else None
+        # Older runs cached location-only (city/state) hits; those are no longer proof of an address.
+        if cached and str(cached.get("evidence_type", "")) == "exact_address":
+            return AddressCheck(
+                True,
+                "cache",
+                candidate,
+                str(cached.get("source_url", "")).strip(),
+                str(cached.get("matched_accepted_entity", "")).strip() or matched_name,
+            )
+        if domain_client is not None and catalog.accepted_domains:
+            crawl_url = domain_client.find_address_evidence(catalog.accepted_domains, candidate)
+            if crawl_url:
+                return AddressCheck(True, "domain_crawl", candidate, crawl_url, matched_name)
+        if search_ready:
+            report(f"live searching {matched_name} + {candidate}")
+            url, mode, error, debug = search_client.find_address_evidence(  # type: ignore[union-attr]
+                search_names[0],
+                candidate,
+                catalog.accepted_domains,
+                related_company_names=search_names[1:],
+            )
+            if debug:
+                debug_parts.append(debug)
+            if url and mode == "exact_address":
+                found = AddressCheck(True, "live_search", candidate, url, matched_name)
+                found.debug = "\n".join(debug_parts)
+                return found
+            if url and not check.location_only_url:
+                check.location_only_url = url
+            if error:
+                check.search_error = error
+    if not search_ready and not check.search_error:
+        check.search_error = "Live search is not configured (no Brave API key)."
+    check.debug = "\n".join(debug_parts)
+    return check
+
+
+def _same_company(left: str, right: str) -> bool:
+    return normalize_company_name(left) == normalize_company_name(right)
+
+
+def _decide_from_address(matched_name: str, name_kind: str, name_score: int, check: AddressCheck) -> RowDecision:
+    """Rule table: name matched + exact address confirmed -> TRUE; otherwise To Review."""
+    decision = RowDecision(matched_company=matched_name, match_score=100 if name_kind == "exact" else name_score)
+    name_label = "Exact" if name_kind == "exact" else "Inexact"
+    if check.found:
+        owner = check.owner or matched_name
+        label = _METHOD_LABELS.get(check.method, check.method)
+        decision.verdict = "TRUE"
+        decision.source_url = check.source_url
+        decision.search_returned = f"Address confirmed via {label}: {check.address}."
+        if not _same_company(owner, matched_name):
+            decision.matched_company = owner
+            decision.confidence = "Medium"
+            decision.match_type = f"cross_entity_address_{check.method}"
+            decision.reason = _format_reason(
+                f"TRUE — Company name matched {matched_name}; address is verified for accepted company {owner} ({label}).",
+                check.source_url,
+            )
+        elif name_kind == "exact":
+            decision.confidence = "High"
+            decision.match_type = f"exact_name_exact_address_{check.method}"
+            decision.reason = _format_reason(f"TRUE — Exact company name + exact address match ({label}).", check.source_url)
+        else:
+            decision.confidence = "Medium"
+            decision.match_type = f"inexact_name_exact_address_{check.method}"
+            decision.reason = _format_reason(f"TRUE — Inexact company name + exact address match ({label}).", check.source_url)
+        return decision
+
+    # Unchanged rule: registry addresses marked "Private Address" cannot be searched, so an exact
+    # name match is accepted on its own.
+    if check.saw_private and name_kind == "exact":
+        decision.verdict = "TRUE"
+        decision.confidence = "High"
+        decision.match_type = "private_address_exact_name"
+        decision.reason = "TRUE — Exact company name + private address."
+        decision.search_returned = "Address was classified as Private Address."
+        return decision
+
+    decision.verdict = "FALSE"
+    decision.confidence = TO_REVIEW
+    decision.match_type = f"{name_kind}_name_address_unconfirmed"
+    decision.review_reason = "Company name matched, but the address could not be confirmed."
+    reason = (
+        f"To Review — {name_label} company name matched {matched_name}, "
+        "but the address could not be confirmed online. Verdict: FALSE."
+    )
+    returned = "Address was not confirmed."
+    if check.location_only_url:
+        reason += f" Location-only evidence (same city/state, not counted): {check.location_only_url}"
+        returned += f" Only location-level (city/state) evidence was found: {check.location_only_url}."
+    elif check.search_error:
+        returned += f" Diagnostic: {check.search_error}"
+    decision.reason = reason
+    decision.search_returned = returned
+    return decision
+
+
 def validate_standard_rows(
     rows: List[InputRow],
     catalog: CompanyCatalog,
@@ -421,593 +594,137 @@ def validate_standard_rows(
     search_client: Optional[BraveSearchClient] = None,
     verify_whois_addresses: bool = False,
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
+    address_cache: Optional[AddressEvidenceCache] = None,
 ) -> List[ValidationResult]:
+    """Validate rows with the name + address rule.
+
+    1. Row has a company name and an address:
+         name not accepted              -> FALSE (no search is run)
+         name accepted, address found   -> TRUE (High for exact names, Medium for inexact)
+         name accepted, address unknown -> To Review (verdict FALSE)
+    2. Row is missing the name or the address: fill it in from RDAP, then apply the same rule.
+    """
     results: List[ValidationResult] = []
     total_rows = len(rows)
-    address_cache = AddressEvidenceCache()
+    if address_cache is None:
+        address_cache = AddressEvidenceCache()
     for index, row in enumerate(rows, start=1):
         if progress_callback is not None:
             progress_callback(index - 1, total_rows, f"Preparing row {row.row_number}")
+
+        def report(message: str, _row_number: int = row.row_number, _index: int = index) -> None:
+            if progress_callback is not None:
+                progress_callback(_index - 1, total_rows, f"Row {_row_number}: {message}")
+
         matched_name, name_kind, name_score, matched_fragment = _best_row_company_match(row.raw_company_name, catalog)
         cleaned_company = matched_fragment or clean_company_name(row.raw_company_name)
         address_candidates = _address_candidates(row.raw_address)
         cleaned_address = "; ".join(address_candidates) if address_candidates else row.raw_address.strip()
-        usable_address_candidates = [address for address in address_candidates if is_usable_address(address)]
-        normalized_address = normalize_address(address_candidates[0]) if address_candidates else normalize_address(cleaned_address)
+        has_address = any(is_usable_address(a) or is_private_address(a) for a in address_candidates)
+        has_name = bool(cleaned_company)
 
-        search_summary = "Checked accepted company candidates in the row, split row addresses, known address book, accepted-domain crawl, and live search. WHOIS is used only when row name or address evidence is missing."
-        search_returned = "No qualifying evidence found."
-        matched_subsidiary = ""
-        column_e = "FALSE"
-        column_f = "FALSE — No connection found with the company or any of its subsidiaries."
-        column_g = ""
-        column_h = "Medium"
-        match_type = "no_match"
-        match_score = name_score
-        source_url = ""
-        review_reason = ""
-        whois_orgname = ""
-        whois_netname = ""
-        whois_domains = ""
-        whois_addresses = ""
-        whois_registry = ""
-        domain_diagnostics: List[str] = []
+        whois_orgname = whois_netname = whois_domains = whois_addresses = whois_registry = ""
         live_search_debug = ""
-        whois_evaluation = WhoisMatchEvaluation()
-        address_match = None
-        location_match = None
+        decision = RowDecision(match_score=name_score)
 
-        if matched_name and address_candidates:
-            for candidate_address in address_candidates:
-                candidate_normalized = normalize_address(candidate_address)
-                candidate_address_match = find_address_match(candidate_address, catalog.known_addresses)
-                company_specific_entries = [
-                    entry for entry in catalog.known_addresses if entry.canonical_name == matched_name
-                ]
-                candidate_location_match = coarse_location_match(candidate_address, company_specific_entries) if company_specific_entries else None
-
-                if candidate_address_match:
-                    address_match = candidate_address_match
-                    search_returned = f"Exact known address matched {candidate_address_match.canonical_name}: {candidate_address}."
-                    matched_subsidiary = candidate_address_match.canonical_name
-                    column_g = matched_subsidiary
-                    source_url = candidate_address_match.source_url
-                    if name_kind == "exact" and matched_name == matched_subsidiary:
-                        column_e = "TRUE"
-                        column_f = _format_reason("TRUE — Exact company name + exact address match.", source_url)
-                        column_h = "High"
-                        match_type = "direct_exact_name_exact_address"
-                        match_score = 100
-                    elif name_kind == "inexact" and matched_name == matched_subsidiary:
-                        column_e = "TRUE"
-                        column_f = _format_reason("TRUE — Inexact name + exact address match.", source_url)
-                        column_h = "Medium"
-                        match_type = "direct_inexact_name_exact_address"
-                        match_score = name_score
-                    else:
-                        column_e = "TRUE"
-                        column_f = _format_reason(
-                            f"TRUE — Address matched accepted subsidiary {matched_subsidiary}.",
-                            source_url,
-                        )
-                        column_h = "Medium"
-                        match_type = "cross_subsidiary_address"
-                        match_score = max(name_score, 100 if matched_subsidiary else 0)
-                    break
-
-                if is_private_address(candidate_address):
-                    search_returned = f"Address was classified as Private Address: {candidate_address}."
-                    if name_kind == "exact":
-                        matched_subsidiary = matched_name
-                        column_e = "TRUE"
-                        column_f = "TRUE — Exact company name + private address."
-                        column_g = matched_name
-                        column_h = "High"
-                        match_type = "private_address_exact_name"
-                        match_score = 100
-                    elif matched_name:
-                        matched_subsidiary = matched_name
-                        column_e = "FALSE"
-                        column_f = "FALSE — Inexact name + private address."
-                        column_g = matched_name
-                        column_h = "Medium"
-                        match_type = "private_address_inexact_name"
-                        match_score = name_score
-                    break
-
-                if candidate_normalized in KNOWN_DATA_CENTER_ADDRESSES and name_kind == "exact":
-                    search_returned = f"Address matched the known data-center list: {candidate_address}."
-                    matched_subsidiary = matched_name
-                    column_e = "TRUE"
-                    column_f = "TRUE — Exact company name + known data center address."
-                    column_g = matched_name
-                    column_h = "High"
-                    match_type = "datacenter_exact_name"
-                    match_score = 100
-                    break
-
-                if is_usable_address(candidate_address) and candidate_location_match:
-                    location_match = candidate_location_match
-                    search_returned = f"Location-level evidence matched {candidate_location_match.canonical_name}: {candidate_address}."
-                    matched_subsidiary = candidate_location_match.canonical_name
-                    column_g = matched_subsidiary
-                    source_url = candidate_location_match.source_url
-                    if name_kind == "exact" and matched_name == matched_subsidiary:
-                        column_e = "TRUE"
-                        column_f = _format_reason("TRUE — Exact company name + state / country match.", source_url)
-                        column_h = "Medium"
-                        match_type = "exact_name_state_country_only"
-                        match_score = 100
-                    elif matched_name:
-                        column_e = "FALSE"
-                        column_f = "FALSE — Inexact name + state / country match only."
-                        column_h = "Medium"
-                        match_type = "inexact_name_state_country_only"
-                        match_score = name_score
-                    break
-
-                cached_address = address_cache.get(candidate_address, catalog) if is_usable_address(candidate_address) else None
-                if cached_address:
-                    cached_owner = str(cached_address.get("matched_accepted_entity", "")).strip()
-                    source_url = str(cached_address.get("source_url", "")).strip()
-                    cached_confidence = str(cached_address.get("confidence", "Medium")).strip() or "Medium"
-                    cached_evidence_type = str(cached_address.get("evidence_type", "exact_address")).strip() or "exact_address"
-                    matched_subsidiary = cached_owner
-                    column_e = "TRUE"
-                    column_g = cached_owner
-                    column_h = cached_confidence
-                    if cached_owner == matched_name:
-                        column_f = _format_reason("TRUE — Accepted company name + cached verified address match.", source_url)
-                        match_type = f"cached_{cached_evidence_type}"
-                    else:
-                        column_f = _format_reason(
-                            f"TRUE — Accepted company name matched {matched_name}; exact address was cached as verified for accepted entity {cached_owner}.",
-                            source_url,
-                        )
-                        match_type = "cached_cross_accepted_entity_address"
-                    match_score = 100 if name_kind == "exact" else name_score
-                    search_returned = f"Address evidence cache matched {cached_owner}: {candidate_address}."
-                    break
-
-                if is_usable_address(candidate_address) and domain_client is not None and catalog.accepted_domains:
-                    if not domain_diagnostics:
-                        domain_diagnostics = domain_client.diagnose_domains(catalog.accepted_domains[:5])
-                    crawl_url = domain_client.find_address_evidence(catalog.accepted_domains, candidate_address)
-                    if crawl_url:
-                        search_returned = f"Exact address was found on accepted domain evidence page {crawl_url}: {candidate_address}."
-                        source_url = crawl_url
-                        matched_subsidiary = matched_name
-                        column_e = "TRUE"
-                        column_f = _format_reason("TRUE — Accepted company name + exact address match.", source_url)
-                        column_g = matched_name
-                        column_h = "High" if name_kind == "exact" else "Medium"
-                        match_type = "domain_exact_name_exact_address" if name_kind == "exact" else "domain_inexact_name_exact_address"
-                        match_score = 100 if name_kind == "exact" else name_score
-                        address_cache.put(candidate_address, matched_name, source_url, "exact_address", column_h)
-                        break
-                    if domain_diagnostics:
-                        search_returned = f"Accepted-domain crawl could not confirm the address. Diagnostic: {domain_diagnostics[0]}"
-
-                if search_client is not None and search_client.is_configured() and is_usable_address(candidate_address):
-                    if progress_callback is not None:
-                        progress_callback(index - 1, total_rows, f"Row {row.row_number}: live searching {matched_name} + {candidate_address}")
-                    search_names = _related_search_names(matched_fragment, matched_name, catalog)
-                    live_search_url, live_search_mode, live_search_error, live_search_debug = search_client.find_address_evidence(
-                        search_names[0],
-                        candidate_address,
-                        catalog.accepted_domains,
-                        related_company_names=search_names[1:],
-                    )
-                    if live_search_url:
-                        evidence_label = "exact address" if live_search_mode == "exact_address" else "location"
-                        search_returned = f"Live search found {evidence_label} evidence at {live_search_url}: {candidate_address}."
-                        source_url = live_search_url
-                        matched_subsidiary = matched_name
-                        column_e = "TRUE"
-                        column_f = _format_reason(
-                            "TRUE — Accepted company name + web-verified address match.",
-                            source_url,
-                        )
-                        column_g = matched_name
-                        column_h = "High" if live_search_mode == "exact_address" else "Medium"
-                        match_type = "search_exact_name_exact_address" if live_search_mode == "exact_address" else "search_exact_name_state_country"
-                        match_score = 100 if name_kind == "exact" else name_score
-                        address_cache.put(candidate_address, matched_name, source_url, live_search_mode, column_h)
-                        break
-                    if live_search_error:
-                        search_returned = f"Live search could not confirm {candidate_address}. Diagnostic: {live_search_error}"
-
-                    if False and _looks_like_specific_address(candidate_address):
-                        for accepted_entity in catalog.accepted_entities:
-                            if accepted_entity == matched_name:
-                                continue
-                            if progress_callback is not None:
-                                progress_callback(index - 1, total_rows, f"Row {row.row_number}: checking whether address belongs to {accepted_entity}")
-                            cross_url, cross_mode, cross_error, live_search_debug = search_client.find_address_evidence(
-                                accepted_entity,
-                                candidate_address,
-                                catalog.accepted_domains,
-                                related_company_names=[catalog.parent_company],
-                            )
-                            if cross_url:
-                                source_url = cross_url
-                                matched_subsidiary = accepted_entity
-                                column_e = "TRUE"
-                                column_f = _format_reason(
-                                    f"TRUE — Accepted company name matched {matched_name}; exact address matched another accepted entity {accepted_entity}.",
-                                    source_url,
-                                )
-                                column_g = accepted_entity
-                                column_h = "High" if cross_mode == "exact_address" else "Medium"
-                                match_type = "cross_accepted_entity_address"
-                                match_score = 100 if name_kind == "exact" else name_score
-                                search_returned = f"Live search matched supplied address to accepted entity {accepted_entity}: {candidate_address}."
-                                address_cache.put(candidate_address, accepted_entity, source_url, cross_mode, column_h)
-                                break
-                            if cross_error:
-                                search_returned = f"Live search could not confirm {candidate_address}. Diagnostic: {cross_error}"
-                        if column_e == "TRUE":
-                            break
-
-        if False:
-            matched_subsidiary = whois_evaluation.matched_name
-            column_e = "TRUE"
-            column_g = matched_subsidiary
-            match_type = whois_evaluation.match_type
-            match_score = whois_evaluation.match_score
-            search_summary = "WHOIS/RDAP-first validation using most-specific customer/org names, NetName, accepted domains, and WHOIS address fields."
-            search_returned = f"WHOIS matched accepted company {matched_subsidiary}."
-            address_location = _whois_address_location_match(cleaned_address, whois_evaluation.address_display.split("; "))
-            exact_whois_name = whois_evaluation.match_type.startswith(("whois_orgname_exact", "whois_netname_exact"))
-            reason_bits = [f"TRUE — WHOIS/RDAP name matched accepted company {matched_subsidiary}."]
-            if whois_evaluation.domain_matched:
-                reason_bits.append(f"Accepted domain evidence: {whois_evaluation.domain_display}.")
-                column_h = "High"
-            elif address_location:
-                reason_bits.append(f"WHOIS address matched row address at {address_location.replace('_', ' ')} level.")
-                column_h = "High"
-            elif whois_evaluation.address_display:
-                reason_bits.append("WHOIS address was present for audit.")
-                column_h = "High" if exact_whois_name else "Medium"
-            else:
-                column_h = "High" if exact_whois_name else "Medium"
-
-            if (
-                verify_whois_addresses
-                and not whois_evaluation.domain_matched
-                and whois_evaluation.address_display
-                and search_client is not None
-                and search_client.is_configured()
-            ):
-                candidate_address = whois_evaluation.address_display.split("; ", 1)[0]
-                live_search_url, live_search_mode, live_search_error, live_search_debug = search_client.find_address_evidence(
-                    matched_subsidiary,
-                    candidate_address,
-                    catalog.accepted_domains,
-                    related_company_names=[catalog.parent_company],
-                )
-                if live_search_url:
-                    source_url = live_search_url
-                    reason_bits.append(f"Web address corroboration found at {source_url}.")
-                    search_returned = f"WHOIS matched accepted company and live search corroborated address at {source_url}."
-                    column_h = "High"
-                    match_type = f"{match_type}_address_verified"
-                elif live_search_error:
-                    search_returned = f"WHOIS matched accepted company; web address corroboration did not confirm it. Diagnostic: {live_search_error}"
-            column_f = " ".join(reason_bits)
-
-        if column_e == "TRUE" or (matched_name and address_candidates):
-            pass
-        elif address_match:
-            search_returned = f"Exact known address matched {address_match.canonical_name}."
-            matched_subsidiary = address_match.canonical_name
-            column_g = matched_subsidiary
-            source_url = address_match.source_url
-            if name_kind == "exact" and matched_name == matched_subsidiary:
-                column_e = "TRUE"
-                column_f = _format_reason("TRUE — Exact company name + exact address match.", source_url)
-                column_h = "High"
-                match_type = "direct_exact_name_exact_address"
-                match_score = 100
-            elif name_kind == "inexact" and matched_name == matched_subsidiary:
-                column_e = "TRUE"
-                column_f = _format_reason("TRUE — Inexact name + exact address match.", source_url)
-                column_h = "Medium"
-                match_type = "direct_inexact_name_exact_address"
-                match_score = name_score
-            else:
-                column_e = "TRUE"
-                column_f = _format_reason(
-                    f"TRUE — Address matched accepted subsidiary {matched_subsidiary}.",
-                    source_url,
-                )
-                column_h = "Medium"
-                match_type = "cross_subsidiary_address"
-                match_score = max(name_score, 100 if matched_subsidiary else 0)
-        elif is_private_address(cleaned_address):
-            search_returned = "Address was classified as Private Address."
-            if name_kind == "exact":
-                matched_subsidiary = matched_name
-                column_e = "TRUE"
-                column_f = "TRUE — Exact company name + private address."
-                column_g = matched_name
-                column_h = "High"
-                match_type = "private_address_exact_name"
-                match_score = 100
-            elif matched_name:
-                matched_subsidiary = matched_name
-                column_e = "FALSE"
-                column_f = "FALSE — Inexact name + private address."
-                column_g = matched_name
-                column_h = "Medium"
-                match_type = "private_address_inexact_name"
-                match_score = name_score
-        elif normalized_address in KNOWN_DATA_CENTER_ADDRESSES and name_kind == "exact":
-            search_returned = "Address matched the known data-center list."
-            matched_subsidiary = matched_name
-            column_e = "TRUE"
-            column_f = "TRUE — Exact company name + known data center address."
-            column_g = matched_name
-            column_h = "High"
-            match_type = "datacenter_exact_name"
-            match_score = 100
-        elif is_usable_address(cleaned_address) and location_match:
-            search_returned = f"Location-level evidence matched {location_match.canonical_name}."
-            matched_subsidiary = location_match.canonical_name
-            column_g = matched_subsidiary
-            source_url = location_match.source_url
-            if name_kind == "exact" and matched_name == matched_subsidiary:
-                column_e = "TRUE"
-                column_f = _format_reason("TRUE — Exact company name + state / country match.", source_url)
-                column_h = "Medium"
-                match_type = "exact_name_state_country_only"
-                match_score = 100
-            elif matched_name:
-                column_e = "FALSE"
-                column_f = "FALSE — Inexact name + state / country match only."
-                column_h = "Medium"
-                match_type = "inexact_name_state_country_only"
-                match_score = name_score
-        elif is_usable_address(cleaned_address) and domain_client is not None and catalog.accepted_domains:
-            domain_diagnostics = domain_client.diagnose_domains(catalog.accepted_domains[:5])
-            crawl_url = domain_client.find_address_evidence(catalog.accepted_domains, cleaned_address)
-            if crawl_url:
-                search_returned = f"Exact address was found on accepted domain evidence page {crawl_url}."
-                source_url = crawl_url
-                if name_kind == "exact" and matched_name:
-                    matched_subsidiary = matched_name
-                    column_e = "TRUE"
-                    column_f = _format_reason("TRUE — Exact company name + exact address match.", source_url)
-                    column_g = matched_name
-                    column_h = "High"
-                    match_type = "domain_exact_name_exact_address"
-                    match_score = 100
-                elif name_kind == "inexact" and matched_name:
-                    matched_subsidiary = matched_name
-                    column_e = "TRUE"
-                    column_f = _format_reason("TRUE — Inexact name + exact address match.", source_url)
-                    column_g = matched_name
-                    column_h = "Medium"
-                    match_type = "domain_inexact_name_exact_address"
-                    match_score = name_score
-                else:
-                    column_e = "FALSE"
-                    column_f = _format_reason(
-                        "To Review — Exact address was found on an accepted domain, but the company name did not match an accepted entity. Verdict: FALSE.",
-                        source_url,
-                    )
-                    column_h = "To Review"
-                    match_type = "domain_address_name_unmatched"
-                    review_reason = "Accepted-domain address evidence exists without accepted company-name match."
-                    match_score = 100
-            else:
-                if domain_diagnostics:
-                    search_returned = f"Accepted-domain crawl could not confirm the address. Diagnostic: {domain_diagnostics[0]}"
-                if search_client is not None and search_client.is_configured() and cleaned_company and is_usable_address(cleaned_address):
-                    live_search_url, live_search_mode, live_search_error, live_search_debug = search_client.find_address_evidence(
-                        cleaned_company or matched_name,
-                        cleaned_address,
-                        catalog.accepted_domains,
-                        related_company_names=[matched_name, catalog.parent_company],
-                    )
-                    if live_search_url:
-                        evidence_label = "exact address" if live_search_mode == "exact_address" else "location"
-                        search_returned = f"Live search found {evidence_label} evidence at {live_search_url}."
-                        source_url = live_search_url
-                        if live_search_mode == "exact_address":
-                            if name_kind == "exact" and matched_name:
-                                matched_subsidiary = matched_name
-                                column_e = "TRUE"
-                                column_f = _format_reason("TRUE — Exact company name + exact address match.", source_url)
-                                column_g = matched_name
-                                column_h = "High"
-                                match_type = "search_exact_name_exact_address"
-                                match_score = 100
-                            elif name_kind == "inexact" and matched_name:
-                                matched_subsidiary = matched_name
-                                column_e = "TRUE"
-                                column_f = _format_reason("TRUE — Inexact name + exact address match.", source_url)
-                                column_g = matched_name
-                                column_h = "Medium"
-                                match_type = "search_inexact_name_exact_address"
-                                match_score = name_score
-                            else:
-                                column_e = "FALSE"
-                                column_f = _format_reason(
-                                    "To Review — Live search found exact address evidence, but the company name did not match an accepted entity. Verdict: FALSE.",
-                                    source_url,
-                                )
-                                column_h = "To Review"
-                                match_type = "search_address_name_unmatched"
-                                review_reason = "Live-search address evidence exists without accepted company-name match."
-                                match_score = 100
-                        elif live_search_mode == "state_country" and name_kind == "exact" and matched_name:
-                            matched_subsidiary = matched_name
-                            column_e = "TRUE"
-                            column_f = _format_reason("TRUE — Exact company name + state / country match.", source_url)
-                            column_g = matched_name
-                            column_h = "Medium"
-                            match_type = "search_exact_name_state_country"
-                            match_score = 100
-                    elif live_search_error:
-                        search_returned = f"Live search could not confirm the address. Diagnostic: {live_search_error}"
-        elif cleaned_company and is_usable_address(cleaned_address) and search_client is not None and search_client.is_configured():
-            live_search_url, live_search_mode, live_search_error, live_search_debug = search_client.find_address_evidence(
-                cleaned_company or matched_name,
-                cleaned_address,
-                catalog.accepted_domains,
-                related_company_names=[matched_name, catalog.parent_company],
+        if has_name and has_address:
+            search_summary = (
+                "Row had a company name and address: checked the name against accepted companies, then tried to "
+                "confirm the address (known addresses, verified-address cache, accepted-domain crawl, live search). "
+                "RDAP was not needed."
             )
-            if live_search_url:
-                evidence_label = "exact address" if live_search_mode == "exact_address" else "location"
-                search_returned = f"Live search found {evidence_label} evidence at {live_search_url}."
-                source_url = live_search_url
-                if live_search_mode == "exact_address":
-                    if name_kind == "exact" and matched_name:
-                        matched_subsidiary = matched_name
-                        column_e = "TRUE"
-                        column_f = _format_reason("TRUE — Exact company name + exact address match.", source_url)
-                        column_g = matched_name
-                        column_h = "High"
-                        match_type = "search_exact_name_exact_address"
-                        match_score = 100
-                    elif name_kind == "inexact" and matched_name:
-                        matched_subsidiary = matched_name
-                        column_e = "TRUE"
-                        column_f = _format_reason("TRUE — Inexact name + exact address match.", source_url)
-                        column_g = matched_name
-                        column_h = "Medium"
-                        match_type = "search_inexact_name_exact_address"
-                        match_score = name_score
-                    else:
-                        column_e = "FALSE"
-                        column_f = _format_reason(
-                            "To Review — Live search found exact address evidence, but the company name did not match an accepted entity. Verdict: FALSE.",
-                            source_url,
-                        )
-                        column_h = "To Review"
-                        match_type = "search_address_name_unmatched"
-                        review_reason = "Live-search address evidence exists without accepted company-name match."
-                        match_score = 100
-                elif live_search_mode == "state_country" and name_kind == "exact" and matched_name:
-                    matched_subsidiary = matched_name
-                    column_e = "TRUE"
-                    column_f = _format_reason("TRUE — Exact company name + state / country match.", source_url)
-                    column_g = matched_name
-                    column_h = "Medium"
-                    match_type = "search_exact_name_state_country"
-                    match_score = 100
-            elif live_search_error:
-                search_returned = f"Live search could not confirm the address. Diagnostic: {live_search_error}"
-        elif row.prefix.strip() and (not matched_name or not usable_address_candidates):
-            whois_evaluation = _run_whois_match(row.prefix, catalog, whois_client)
-            whois_orgname = whois_evaluation.org_display
-            whois_netname = whois_evaluation.net_display
-            whois_domains = whois_evaluation.domain_display
-            whois_addresses = whois_evaluation.address_display
-            whois_registry = whois_evaluation.registry_display
-            whois_name = whois_evaluation.matched_name
-            whois_type = whois_evaluation.match_type
-            whois_score = whois_evaluation.match_score
-            whois_error = whois_evaluation.error
-            search_summary = "WHOIS/RDAP fallback because the row was missing an accepted company candidate or a usable address."
-            if whois_error:
-                search_returned = whois_error
-                column_e = "FALSE"
-                column_f = "FALSE — No connection found with the company or any of its subsidiaries."
-                match_type = "no_match"
-            elif whois_type in {"whois_orgname_exact", "whois_netname_exact", "whois_orgname_exact_domain", "whois_netname_exact_domain", "whois_inexact_name_domain"}:
-                matched_subsidiary = whois_name
-                column_e = "TRUE"
-                column_g = whois_name
-                exact_whois_name = whois_type.startswith(("whois_orgname_exact", "whois_netname_exact"))
-                column_h = "High" if whois_evaluation.domain_matched or exact_whois_name else "Medium"
-                column_f = "TRUE — WHOIS/RDAP matched accepted company."
-                if whois_evaluation.domain_matched:
-                    column_f += f" Accepted domain evidence: {whois_evaluation.domain_display}."
-                match_type = whois_type
-                match_score = whois_score
-                search_returned = f"WHOIS matched accepted subsidiary {whois_name}."
-                if whois_evaluation.address_display and search_client is not None and search_client.is_configured():
-                    address_corroborated = False
-                    for candidate_address in _address_candidates(whois_evaluation.address_display):
-                        if progress_callback is not None:
-                            progress_callback(index - 1, total_rows, f"Row {row.row_number}: verifying WHOIS address {candidate_address}")
-                        live_search_url, live_search_mode, live_search_error, live_search_debug = search_client.find_address_evidence(
-                            matched_subsidiary,
-                            candidate_address,
-                            catalog.accepted_domains,
-                            related_company_names=[catalog.parent_company],
-                        )
-                        if live_search_url:
-                            address_corroborated = True
-                            source_url = live_search_url
-                            column_h = "High"
-                            column_f += f" Web address corroboration found at {source_url}."
-                            search_returned = f"WHOIS matched accepted company and live search corroborated {candidate_address} at {source_url}."
-                            match_type = f"{match_type}_address_verified"
-                            address_cache.put(candidate_address, matched_subsidiary, source_url, live_search_mode or "exact_address", column_h)
-                            break
-                        if live_search_error:
-                            search_returned = f"WHOIS matched accepted company; web address corroboration did not confirm {candidate_address}. Diagnostic: {live_search_error}"
-                    if not address_corroborated:
-                        column_e = "FALSE"
-                        column_h = "To Review"
-                        review_reason = "WHOIS matched accepted company, but WHOIS address was not web-corroborated."
-                        column_f = "To Review — WHOIS/RDAP matched an accepted company, but the WHOIS address could not be web-corroborated. Verdict: FALSE."
-                        match_type = f"{whois_type}_address_unverified"
-            elif whois_type == "whois_close_not_exact":
-                matched_subsidiary = whois_name
-                column_e = "FALSE"
-                column_f = "To Review — WHOIS entity name was very close to accepted subsidiary but not exact. Verdict: FALSE."
-                column_g = whois_name
-                column_h = "To Review"
-                match_type = whois_type
-                match_score = whois_score
-                review_reason = "WHOIS very close but not exact."
-                search_returned = f"WHOIS was very close to accepted subsidiary {whois_name}, but not exact."
-            elif whois_type == "whois_domain_exact":
-                column_e = "FALSE"
-                column_f = "To Review — WHOIS domain matched an accepted domain, but the entity name was not exact. Verdict: FALSE."
-                column_h = "To Review"
-                match_type = whois_type
-                match_score = whois_score
-                review_reason = "WHOIS domain matched accepted domain without exact entity name."
-                search_returned = f"WHOIS exposed accepted domain(s): {whois_domains}."
+            if not matched_name:
+                decision.reason = "FALSE — Company name did not match the parent company or any accepted subsidiary."
+                decision.search_returned = (
+                    f"Best accepted-name similarity was {name_score}/100, below the match threshold. "
+                    "No address search was run."
+                )
             else:
-                search_returned = "WHOIS resolved the prefix, but OrgName and NetName did not match an accepted company."
-        elif not is_usable_address(cleaned_address):
-            search_returned = "Address was blank or not usable."
+                search_names = _related_search_names(matched_fragment, matched_name, catalog)
+                check = _confirm_address(
+                    matched_name, name_kind, search_names, address_candidates, catalog,
+                    address_cache, domain_client, search_client, report,
+                )
+                live_search_debug = check.debug
+                decision = _decide_from_address(matched_name, name_kind, name_score, check)
+                if check.found and check.method in {"domain_crawl", "live_search"}:
+                    address_cache.put(check.address, decision.matched_company, check.source_url, "exact_address", decision.confidence)
+        elif row.prefix.strip():
+            missing = "company name and address" if not has_name and not has_address else ("address" if not has_address else "company name")
+            search_summary = f"Row was missing the {missing}, so RDAP was used to fill it in."
+            report("RDAP lookup")
+            evaluation = _run_whois_match(row.prefix, catalog, whois_client)
+            whois_orgname = evaluation.org_display
+            whois_netname = evaluation.net_display
+            whois_domains = evaluation.domain_display
+            whois_addresses = evaluation.address_display
+            whois_registry = evaluation.registry_display
+            if matched_name:
+                use_name, use_kind, use_score = matched_name, name_kind, name_score
+            elif evaluation.match_type in EXACT_WHOIS_TYPES:
+                use_name, use_kind, use_score = evaluation.matched_name, "exact", evaluation.match_score
+            elif evaluation.match_type in INEXACT_WHOIS_TYPES:
+                use_name, use_kind, use_score = evaluation.matched_name, "inexact", evaluation.match_score
+            else:
+                use_name, use_kind, use_score = "", "none", evaluation.match_score
 
-        if column_e == "FALSE" and match_type == "no_match" and whois_evaluation.match_type == "whois_domain_exact":
-            column_f = "To Review — WHOIS/RDAP exposed an accepted domain, but the entity name was not an accepted company. Verdict: FALSE."
-            column_h = "To Review"
-            match_type = whois_evaluation.match_type
-            match_score = whois_evaluation.match_score
-            review_reason = "WHOIS domain matched accepted domain without exact entity name."
-            search_returned = f"WHOIS exposed accepted domain(s): {whois_evaluation.domain_display}."
-        elif column_e == "FALSE" and match_type == "no_match" and whois_evaluation.match_type == "whois_close_not_exact":
-            matched_subsidiary = whois_evaluation.matched_name
-            column_f = "To Review — WHOIS/RDAP entity name was very close to an accepted company but not exact. Verdict: FALSE."
-            column_g = matched_subsidiary
-            column_h = "To Review"
-            match_type = whois_evaluation.match_type
-            match_score = whois_evaluation.match_score
-            review_reason = "WHOIS very close but not exact."
-            search_returned = f"WHOIS was very close to accepted company {matched_subsidiary}, but not exact."
+            if evaluation.error and not use_name:
+                decision.verdict = "FALSE"
+                decision.confidence = TO_REVIEW
+                decision.match_type = "whois_error"
+                decision.review_reason = "RDAP lookup failed."
+                decision.reason = f"To Review — RDAP lookup failed, so the row could not be checked: {evaluation.error}. Verdict: FALSE."
+                decision.search_returned = evaluation.error
+            elif use_name:
+                addresses = [a for a in address_candidates if is_usable_address(a) or is_private_address(a)]
+                if not addresses:
+                    addresses = _address_candidates(evaluation.address_display)
+                search_names = _related_search_names(matched_fragment or use_name, use_name, catalog)
+                check = _confirm_address(
+                    use_name, use_kind, search_names, addresses, catalog,
+                    address_cache, domain_client, search_client, report,
+                )
+                live_search_debug = check.debug
+                decision = _decide_from_address(use_name, use_kind, use_score, check)
+                decision.match_type = f"whois_{decision.match_type}" if not matched_name else decision.match_type
+                if check.found and check.method in {"domain_crawl", "live_search"}:
+                    address_cache.put(check.address, decision.matched_company, check.source_url, "exact_address", decision.confidence)
+            elif evaluation.match_type == "whois_domain_exact":
+                decision.confidence = TO_REVIEW
+                decision.match_type = "whois_domain_exact"
+                decision.match_score = evaluation.match_score
+                decision.review_reason = "RDAP domain matched an accepted domain without an accepted company name."
+                decision.reason = "To Review — RDAP domain matched an accepted domain, but the entity name was not an accepted company. Verdict: FALSE."
+                decision.search_returned = f"RDAP exposed accepted domain(s): {whois_domains}."
+            else:
+                decision.reason = "FALSE — RDAP name did not match the parent company or any accepted subsidiary."
+                decision.search_returned = "RDAP resolved the prefix, but no customer/org name or NetName matched an accepted company."
+                decision.match_score = evaluation.match_score
+        else:
+            search_summary = "Row had no prefix and was missing the company name or address."
+            decision.confidence = TO_REVIEW
+            decision.match_type = "insufficient_data"
+            decision.review_reason = "Row is missing data."
+            decision.reason = "To Review — Row is missing the prefix and the company name or address. Verdict: FALSE."
+            decision.search_returned = "Nothing to check."
 
-        mismatch = row.analyst_decision in {"TRUE", "FALSE"} and row.analyst_decision != column_e
+        is_review = decision.confidence == TO_REVIEW
+        mismatch = (
+            row.analyst_decision in {"TRUE", "FALSE"}
+            and row.analyst_decision != decision.verdict
+            and not is_review
+        )
         audit_steps = [
             f"1. Row number: {row.row_number}",
             f"2. Company name extracted: {cleaned_company or '[blank/unusable]'}",
             f"3. Address found in the row: {cleaned_address or '[blank]'}",
             f"4. What the engine searched: {search_summary}",
-            f"5. What the search returned: {search_returned}{f' Registry: {whois_registry}.' if whois_registry else ''}",
-            f"6. Which subsidiary matched: {matched_subsidiary or 'No accepted subsidiary matched.'}",
-            f"7. Verdict: {column_e}",
-            f"8. Column F output: {column_f}",
-            f"9. Column G output: {column_g or '[blank]'}",
-            f"10. Column H output: {column_h}",
+            f"5. What the search returned: {decision.search_returned}{f' Registry: {whois_registry}.' if whois_registry else ''}",
+            f"6. Which subsidiary matched: {decision.matched_company or 'No accepted subsidiary matched.'}",
+            f"7. Verdict: {decision.verdict}",
+            f"8. Column F output: {decision.reason}",
+            f"9. Column G output: {decision.matched_company or '[blank]'}",
+            f"10. Column H output: {decision.confidence}",
         ]
         if whois_orgname or whois_netname or whois_domains or whois_addresses:
             audit_steps.append(
@@ -1026,23 +743,23 @@ def validate_standard_rows(
                 column_b=row.prefix,
                 column_c=row.raw_company_name,
                 column_d=row.raw_address,
-                column_e=column_e,
-                column_f=column_f,
-                column_g=column_g,
-                column_h=column_h,
+                column_e=decision.verdict,
+                column_f=decision.reason,
+                column_g=decision.matched_company,
+                column_h=decision.confidence,
                 flag_mismatch=mismatch,
                 cleaned_company_name=cleaned_company,
                 cleaned_address=cleaned_address,
-                matched_subsidiary=matched_subsidiary,
-                match_type=match_type,
-                match_score=match_score,
+                matched_subsidiary=decision.matched_company,
+                match_type=decision.match_type,
+                match_score=decision.match_score,
                 whois_orgname=whois_orgname,
                 whois_netname=whois_netname,
                 whois_domains=whois_domains,
                 whois_addresses=whois_addresses,
                 whois_registry=whois_registry,
-                source_url=source_url,
-                review_reason=review_reason,
+                source_url=decision.source_url,
+                review_reason=decision.review_reason,
                 live_search_debug=live_search_debug,
                 audit_steps=audit_steps,
             )

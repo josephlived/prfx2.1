@@ -100,7 +100,7 @@ def results_to_dataframe(results: Iterable[ValidationResult]) -> pd.DataFrame:
                 "Reason": result.column_f,
                 "Matched Company Name": result.column_g,
                 "Confidence": result.column_h,
-                "Mismatch A vs E": "YES" if result.flag_mismatch else "",
+                "Mismatch A vs E": "YES" if result.flag_mismatch else ("REVIEW" if result.column_h == "To Review" else ""),
                 "Match Type": result.match_type,
                 "Match Score": result.match_score,
                 "WHOIS OrgName": result.whois_orgname,
@@ -336,9 +336,11 @@ with tab_standard:
                 elapsed_placeholder.caption(f"Elapsed: {time.perf_counter() - started_at:.1f}s")
                 result_df = results_to_dataframe(results)
                 mismatch_count = sum(result.flag_mismatch for result in results)
-                left, right = st.columns(2)
+                review_count = sum(result.column_h == "To Review" for result in results)
+                left, middle, right = st.columns(3)
                 left.metric("Rows Processed", len(results))
-                right.metric("Analyst vs Engine Mismatches", mismatch_count)
+                middle.metric("Analyst vs Engine Mismatches", mismatch_count)
+                right.metric("To Review", review_count)
                 if not whois_client.is_available():
                     st.info("WHOIS-dependent cases will stay FALSE until `ipwhois` is installed. Address-book and deterministic rules still work.")
                 st.dataframe(result_df, use_container_width=True)
@@ -353,6 +355,8 @@ with tab_standard:
                     header = f"Row {result.row_number} | Engine={result.column_e} | Analyst={result.column_a or '[blank]'}"
                     if result.flag_mismatch:
                         header += " | MISMATCH"
+                    elif result.column_h == "To Review":
+                        header += " | TO REVIEW"
                     with st.expander(header):
                         for step in result.audit_steps:
                             st.write(step)
